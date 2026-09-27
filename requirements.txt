@@ -1,0 +1,6 @@
+pandas
+numpy
+pulp
+pytest
+streamlit
+plotly
