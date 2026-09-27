@@ -10,7 +10,7 @@ from backend.config import (
     BATTERY_CAPACITY_KWH,
     BATTERY_MAX_POWER_KW,
     EV_BATTERY_CAPACITY_KWH,
-    EV_DEPART_MOY_H,
+    EV_DEPART_MOYEN_H,
     EV_MAX_CHARGE_KW,
     GRID_LIMIT_KW,
     MAISONS_AVEC_BATTERIE,
@@ -98,7 +98,7 @@ def run_sandbox(measurements: pd.DataFrame, limit_kw: float) -> pd.DataFrame:
             EV_MAX_CHARGE_KW,
             bool(row.ev_connected),
             18,
-            EV_DEPART_MOY_H,
+            EV_DEPART_MOYEN_H,
             float(row.ev_soc),
         )
         for index, row in enumerate(first_hour.itertuples(), start=1)
@@ -248,7 +248,7 @@ with resources_tab:
     with ev_tab:
         ev_display = ev_houses[["device_id", "house_id", "ev_connected", "ev_soc"]].copy()
         ev_display["État"] = ev_display["ev_connected"].map({1: "Connecté", 0: "Déconnecté"})
-        ev_display["Départ prévu"] = f"{EV_DEPART_MOY_H} h"
+        ev_display["Départ prévu"] = f"{EV_DEPART_MOYEN_H} h"
         ev_display = ev_display[["device_id", "house_id", "État", "ev_soc", "Départ prévu"]]
         st.dataframe(
             ev_display.rename(columns={"device_id": "VE", "house_id": "Maison", "ev_soc": "SOC (%)"}),
