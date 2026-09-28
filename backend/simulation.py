@@ -46,7 +46,8 @@ def build_resource_objects(scenario, jour):
     if measurements.empty:
         return batteries, evs, hvacs
 
-    for _, row in measurements.iterrows():
+    first_hour = measurements[measurements["heure"] == measurements["heure"].min()].sort_values("house_id")
+    for _, row in first_hour.iterrows():
         if row["battery_soc"] and row["battery_soc"] > 0:
             batteries.append(Battery(f"B{len(batteries) + 1:03d}", 10.0, float(row["battery_soc"]), 5.0))
         if row["ev_soc"] and row["ev_soc"] > 0:
@@ -65,22 +66,16 @@ def run_simulation(mode="rules"):
             if measurements.empty:
                 continue
             daily_actions = []
-            daily_peak_before = float(measurements["grid_import_kw"].max())
-            daily_peak_after = daily_peak_before
+            hourly_demand_before = measurements.groupby("heure")["grid_import_kw"].sum()
+            daily_peak_before = float(hourly_demand_before.max())
+            daily_peak_after = 0.0
 
-            battery_objs = []
-            ev_objs = []
-            hvac_objs = []
-            for _, row in measurements.iterrows():
-                if row["battery_soc"] > 0:
-                    battery_objs.append(Battery(f"B{len(battery_objs)+1:03d}", 10.0, float(row["battery_soc"]), 5.0))
-                if row["ev_soc"] > 0:
-                    ev_objs.append(EV(f"E{len(ev_objs)+1:03d}", 60.0, 7.0, bool(row["ev_connected"]), 18, 7, float(row["ev_soc"])))
-                hvac_objs.append(HVAC(f"H{len(hvac_objs)+1:03d}", float(row["hvac_kw"]), 0.5, float(row["hvac_kw"])))
+            battery_objs, ev_objs, hvac_objs = build_resource_objects(scenario, jour)
 
             for heure in range(24):
                 hour_rows = measurements[measurements["heure"] == heure]
                 grid_demand = float(hour_rows["grid_import_kw"].sum())
+                demand_after = grid_demand
                 forecast = prevoir_demande(measurements, jour, heure + 1)
                 if grid_demand > GRID_LIMIT_KW or forecast > GRID_LIMIT_KW:
                     deficit = max(0.0, max(grid_demand, forecast) - GRID_LIMIT_KW)
@@ -106,7 +101,7 @@ def run_simulation(mode="rules"):
                             **action,
                         })
                     demand_after = max(0.0, grid_demand - sum(abs(item["power_kw"]) for item in actions))
-                    daily_peak_after = min(daily_peak_after, demand_after)
+                daily_peak_after = max(daily_peak_after, demand_after)
 
             energie_deplacee = sum(abs(action["power_kw"]) for action in daily_actions)
             economie_estimee = (daily_peak_before - daily_peak_after) * PRIX_ELECTRICITE_EUR_KWH

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import closing
+from html import escape
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -24,6 +25,57 @@ from backend.models import Battery, EV, HVAC
 from backend.orchestrator import dispatch
 
 st.set_page_config(page_title="iDER | Pilotage énergétique", page_icon="⚡", layout="wide")
+st.markdown(
+    """
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+    :root {
+        --green-900: #0B3D2E;
+        --green-700: #1F6F50;
+        --green-500: #3CB371;
+        --green-300: #8FD9B6;
+        --green-100: #E3F5EC;
+        --bg: #F7FAF8;
+        --text: #1C2620;
+        --alert: #E76F51;
+    }
+    html, body, [class*="st-"] { font-family: 'Inter', sans-serif; }
+    .stApp { background: var(--bg); color: var(--text); }
+    section[data-testid="stSidebar"] { background: var(--green-900); }
+    section[data-testid="stSidebar"] * { color: var(--green-100); }
+    section[data-testid="stSidebar"] [data-baseweb="select"] > div {
+        background: var(--green-100);
+        border-color: var(--green-300);
+    }
+    section[data-testid="stSidebar"] [data-baseweb="select"] span,
+    section[data-testid="stSidebar"] [data-baseweb="select"] input { color: var(--green-900); }
+    .ider-brand { color: var(--green-100); font-size: 1.55rem; font-weight: 700; }
+    .ider-brand-note { color: var(--green-300); font-size: 0.82rem; }
+    .ider-legend { margin-top: 1.25rem; padding-top: 0.9rem; border-top: 1px solid color-mix(in srgb, var(--green-100) 25%, transparent); }
+    .legend-line { margin: 0.3rem 0; font-size: 0.82rem; }
+    .legend-dot { display: inline-block; width: 0.58rem; height: 0.58rem; border-radius: 50%; margin-right: 0.45rem; }
+    .stTabs [data-baseweb="tab-list"] { gap: 0.35rem; }
+    .stTabs [aria-selected="true"] { color: var(--green-700); }
+    [data-testid="stMetricLabel"] { color: var(--green-900); font-weight: 600; }
+    [data-testid="stMetricValue"] { color: var(--text); }
+    .resource-title { color: var(--green-900); font-weight: 600; margin-bottom: 0.25rem; }
+    .resource-meta { color: color-mix(in srgb, var(--text) 70%, transparent); font-size: 0.84rem; }
+    .soc-track { height: 0.58rem; width: 100%; background: var(--green-100); border-radius: 1rem; overflow: hidden; margin: 0.7rem 0 0.35rem; }
+    .soc-fill { height: 100%; border-radius: inherit; }
+    .status-badge { display: inline-block; padding: 0.18rem 0.5rem; border-radius: 1rem; background: var(--green-100); color: var(--green-700); font-size: 0.76rem; font-weight: 600; }
+    .status-muted { display: inline-block; padding: 0.18rem 0.5rem; border-radius: 1rem; background: color-mix(in srgb, var(--text) 8%, var(--bg)); color: var(--text); font-size: 0.76rem; font-weight: 600; }
+    .timeline-entry { border-left: 4px solid var(--green-700); padding: 0.12rem 0 0.12rem 0.85rem; }
+    .timeline-ev { border-left-color: var(--green-500); }
+    .timeline-hvac { border-left-color: var(--green-300); }
+    .timeline-hour { color: var(--green-900); font-weight: 700; }
+    .timeline-detail { color: color-mix(in srgb, var(--text) 78%, transparent); margin-top: 0.2rem; }
+    .timeline-justification { color: color-mix(in srgb, var(--text) 68%, transparent); font-size: 0.88rem; margin: 0.35rem 0 0; }
+    .sandbox-note { border-left: 3px solid var(--green-500); padding-left: 0.75rem; color: var(--text); }
+    .peak-warning { color: var(--alert); font-weight: 600; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 init_db()
 
 
@@ -151,8 +203,99 @@ def run_sandbox(measurements: pd.DataFrame, limit_kw: float) -> pd.DataFrame:
     return pd.DataFrame(plan)
 
 
+PLOTLY_COLORS = {
+    "green_900": "#0B3D2E",
+    "green_700": "#1F6F50",
+    "green_500": "#3CB371",
+    "green_300": "#8FD9B6",
+    "green_100": "#E3F5EC",
+    "bg": "#F7FAF8",
+    "text": "#1C2620",
+    "alert": "#E76F51",
+}
+
+
+def render_metric_grid(metrics: list[dict], columns_per_row: int = 4) -> None:
+    for start in range(0, len(metrics), columns_per_row):
+        columns = st.columns(columns_per_row)
+        for column, item in zip(columns, metrics[start : start + columns_per_row]):
+            with column:
+                with st.container(border=True):
+                    st.metric(
+                        item["label"],
+                        item["value"],
+                        delta=item.get("delta"),
+                        delta_color=item.get("delta_color", "normal"),
+                    )
+
+
+def build_grid_figure(hourly: pd.DataFrame) -> go.Figure:
+    figure = go.Figure()
+    upper_exceedance = hourly["demande_kw"].clip(lower=GRID_LIMIT_KW)
+    limit_line = [GRID_LIMIT_KW] * len(hourly)
+    figure.add_trace(
+        go.Scatter(
+            x=hourly["heure"],
+            y=upper_exceedance,
+            mode="lines",
+            line={"width": 0, "color": PLOTLY_COLORS["alert"]},
+            hoverinfo="skip",
+            showlegend=False,
+        )
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=hourly["heure"],
+            y=limit_line,
+            mode="lines",
+            line={"width": 0, "color": PLOTLY_COLORS["alert"]},
+            fill="tonexty",
+            fillcolor="rgba(231, 111, 81, 0.18)",
+            hoverinfo="skip",
+            showlegend=False,
+        )
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=hourly["heure"],
+            y=hourly["demande_kw"],
+            mode="lines+markers",
+            name="Demande du quartier",
+            line={"color": PLOTLY_COLORS["green_700"], "width": 3},
+            marker={"color": PLOTLY_COLORS["green_500"], "size": 6},
+        )
+    )
+    figure.add_hline(
+        y=GRID_LIMIT_KW,
+        line_dash="dash",
+        line_color=PLOTLY_COLORS["text"],
+        annotation_text="Limite réseau",
+        annotation_position="top left",
+    )
+    figure.update_layout(
+        xaxis_title="Heure",
+        yaxis_title="Puissance (kW)",
+        xaxis={"dtick": 1, "range": [0, 23], "gridcolor": "rgba(11, 61, 46, 0.08)"},
+        yaxis={"gridcolor": "rgba(11, 61, 46, 0.08)"},
+        height=430,
+        margin={"l": 20, "r": 20, "t": 45, "b": 20},
+        paper_bgcolor="rgba(0, 0, 0, 0)",
+        plot_bgcolor="rgba(0, 0, 0, 0)",
+        font={"family": "Inter, sans-serif", "color": PLOTLY_COLORS["text"]},
+        legend={"orientation": "h", "y": 1.08},
+    )
+    return figure
+
+
+def resource_card(title: str, detail: str, badge: str | None = None) -> None:
+    st.markdown(f'<div class="resource-title">{escape(title)}</div>', unsafe_allow_html=True)
+    if badge:
+        st.markdown(badge, unsafe_allow_html=True)
+    st.markdown(f'<div class="resource-meta">{escape(detail)}</div>', unsafe_allow_html=True)
+
+
 st.title("iDER | Orchestration énergétique")
-st.caption("Tableau de pilotage du quartier · données SQLite · simulation, pas de commande matérielle")
+st.caption("Données de simulation du quartier · lecture directe de SQLite")
 
 available_scenarios = read_query("SELECT DISTINCT scenario FROM measurements ORDER BY scenario")
 if available_scenarios.empty:
@@ -160,16 +303,27 @@ if available_scenarios.empty:
     st.stop()
 
 scenario_options = [scenario for scenario in SCENARIOS if scenario in available_scenarios["scenario"].tolist()]
-selector_columns = st.columns([1, 1, 3])
-with selector_columns[0]:
+with st.sidebar:
+    st.markdown('<div class="ider-brand">iDER</div>', unsafe_allow_html=True)
+    st.markdown('<div class="ider-brand-note">Orchestration énergétique distribuée</div>', unsafe_allow_html=True)
+    st.divider()
     selected_scenario = st.selectbox("Scénario", scenario_options, format_func=lambda value: value.capitalize())
 available_days = read_query(
     "SELECT DISTINCT jour FROM measurements WHERE scenario = ? ORDER BY jour",
     (selected_scenario,),
 )
 day_options = available_days["jour"].astype(int).tolist()
-with selector_columns[1]:
+with st.sidebar:
     selected_day = st.selectbox("Jour", day_options, format_func=lambda value: f"Jour {value}")
+    st.markdown(
+        """
+        <div class="ider-legend">
+          <div class="legend-line"><span class="legend-dot" style="background:var(--green-500)"></span>Vert : ressources DER</div>
+          <div class="legend-line"><span class="legend-dot" style="background:var(--alert)"></span>Corail : dépassement réseau</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 measurements = read_day(selected_scenario, selected_day)
 if measurements.empty:
@@ -199,123 +353,97 @@ overview_tab, resources_tab, grid_tab, orchestrator_tab, results_tab = st.tabs(
 
 with overview_tab:
     st.subheader(f"{selected_scenario.capitalize()} · jour {selected_day}")
-    left, right = st.columns(2)
-    with left:
-        st.metric("DER modélisées", f"{MAISONS_AVEC_PV + MAISONS_AVEC_BATTERIE + MAISONS_AVEC_EV + NB_MAISONS}")
-        st.metric("Puissance PV max observée", f"{pv_capacity_estimate:.1f} kW")
-        st.metric("Capacité batterie totale", f"{MAISONS_AVEC_BATTERIE * BATTERY_CAPACITY_KWH:.0f} kWh")
-        st.metric("Véhicules électriques", f"{len(ev_houses)}")
-    with right:
-        st.metric(
-            "Demande réseau au pic du jour",
-            f"{measured_peak:.1f} kW",
-            f"{measured_peak - GRID_LIMIT_KW:+.1f} kW vs limite {GRID_LIMIT_KW} kW",
-            delta_color="inverse",
+    overview_metrics = [
+        {"label": "DER modélisées", "value": f"{MAISONS_AVEC_PV + MAISONS_AVEC_BATTERIE + MAISONS_AVEC_EV + NB_MAISONS}"},
+        {"label": "Puissance PV max observée", "value": f"{pv_capacity_estimate:.1f} kW"},
+        {"label": "Capacité batterie totale", "value": f"{MAISONS_AVEC_BATTERIE * BATTERY_CAPACITY_KWH:.0f} kWh"},
+        {"label": "Véhicules électriques", "value": f"{len(ev_houses)}"},
+        {
+            "label": "Demande au pic du jour",
+            "value": f"{measured_peak:.1f} kW",
+            "delta": f"{measured_peak - GRID_LIMIT_KW:+.1f} kW vs limite",
+            "delta_color": "inverse",
+        },
+    ]
+    if not kpi.empty:
+        kpi_row = kpi.iloc[0]
+        before = float(kpi_row["pic_avant_kw"])
+        after = float(kpi_row["pic_apres_kw"])
+        reduction = ((before - after) / before * 100.0) if before else 0.0
+        overview_metrics.extend(
+            [
+                {"label": "Réduction de pic enregistrée", "value": f"{reduction:.1f}%"},
+                {"label": "Économie estimée enregistrée", "value": f"{float(kpi_row['economie_estimee_eur']):.2f} €"},
+            ]
         )
-        if not kpi.empty:
-            kpi_row = kpi.iloc[0]
-            before = float(kpi_row["pic_avant_kw"])
-            after = float(kpi_row["pic_apres_kw"])
-            reduction = ((before - after) / before * 100.0) if before else 0.0
-            st.metric("Réduction de pic enregistrée", f"{reduction:.1f}%")
-            st.metric("Économie estimée enregistrée", f"{float(kpi_row['economie_estimee_eur']):.2f} €")
-            if abs(before - measured_peak) > 1.0:
-                st.warning(
-                    f"Écart dans les données persistées : le pic agrégé des mesures vaut {measured_peak:.2f} kW, "
-                    f"mais kpi_results.pic_avant_kw vaut {before:.4f} kW. Les KPI sont affichés tels qu'enregistrés; "
-                    "l'application ne modifie pas la logique de simulation."
-                )
-        else:
-            st.warning("Aucun KPI enregistré pour cette sélection. Lancez `python backend/simulation.py`.")
-    st.caption("La puissance PV affichée est une estimation issue des maxima observés par maison; le dataset ne stocke pas de puissance nominale constructeur.")
+        if abs(before - measured_peak) > 1.0:
+            st.markdown(
+                f'<div class="sandbox-note">Écart entre les mesures agrégées ({measured_peak:.2f} kW) et le pic KPI enregistré ({before:.4f} kW).</div>',
+                unsafe_allow_html=True,
+            )
+    else:
+        overview_metrics.append({"label": "KPI enregistrés", "value": "Indisponibles"})
+    render_metric_grid(overview_metrics)
+    st.caption("La puissance PV est estimée depuis les maxima observés; le dataset ne stocke pas la puissance nominale constructeur.")
 
 with resources_tab:
     pv_tab, battery_tab, ev_tab, hvac_tab = st.tabs(["PV", "Batteries", "VE", "HVAC"])
     with pv_tab:
-        st.metric("Maisons avec PV", len(pv_houses))
-        st.dataframe(
-            pv_houses[["house_id", "pv_kw"]].rename(columns={"house_id": "Maison", "pv_kw": "Puissance max observée (kW)"}),
-            use_container_width=True,
-            hide_index=True,
-        )
+        st.caption(f"{len(pv_houses)} maisons avec production photovoltaïque observée")
+        for start in range(0, len(pv_houses), 4):
+            columns = st.columns(4)
+            for column, row in zip(columns, pv_houses.iloc[start : start + 4].itertuples()):
+                with column:
+                    with st.container(border=True):
+                        resource_card(row.house_id, f"Puissance PV max observée · {row.pv_kw:.2f} kW")
     with battery_tab:
-        st.caption("Le SOC est celui de la dernière mesure du jour. Le score est le cumul des décharges enregistrées pour l'identifiant d'orchestration correspondant.")
-        for row in battery_houses.itertuples():
-            line = st.columns([1, 2, 1])
-            line[0].markdown(f"**{row.device_id}** · {row.house_id}")
-            line[1].progress(min(100, max(0, int(row.battery_soc))), text=f"SOC {row.battery_soc:.1f}%")
-            line[2].metric("Stress (kWh)", f"{row.stress_score_kwh:.2f}")
+        st.caption("SOC de fin de journée et cumul des décharges enregistrées par batterie.")
+        for start in range(0, len(battery_houses), 4):
+            columns = st.columns(4)
+            for column, row in zip(columns, battery_houses.iloc[start : start + 4].itertuples()):
+                soc_color = "var(--green-700)" if row.battery_soc >= 65 else "var(--green-300)"
+                with column:
+                    with st.container(border=True):
+                        resource_card(f"{row.device_id} · {row.house_id}", f"Stress d'équité · {row.stress_score_kwh:.2f} kWh")
+                        st.markdown(
+                            f'<div class="soc-track" role="progressbar" aria-valuenow="{row.battery_soc:.0f}" aria-valuemin="0" aria-valuemax="100"><div class="soc-fill" style="width:{min(100, max(0, row.battery_soc)):.1f}%;background:{soc_color}"></div></div><div class="resource-meta">SOC · {row.battery_soc:.1f}%</div>',
+                            unsafe_allow_html=True,
+                        )
     with ev_tab:
-        ev_display = ev_houses[["device_id", "house_id", "ev_connected", "ev_soc"]].copy()
-        ev_display["État"] = ev_display["ev_connected"].map({1: "Connecté", 0: "Déconnecté"})
-        ev_display["Départ prévu"] = f"{EV_DEPART_MOYEN_H} h"
-        ev_display = ev_display[["device_id", "house_id", "État", "ev_soc", "Départ prévu"]]
-        st.dataframe(
-            ev_display.rename(columns={"device_id": "VE", "house_id": "Maison", "ev_soc": "SOC (%)"}),
-            use_container_width=True,
-            hide_index=True,
-        )
+        for start in range(0, len(ev_houses), 4):
+            columns = st.columns(4)
+            for column, row in zip(columns, ev_houses.iloc[start : start + 4].itertuples()):
+                badge_class = "status-badge" if row.ev_connected else "status-muted"
+                state = "Connecté" if row.ev_connected else "Déconnecté"
+                with column:
+                    with st.container(border=True):
+                        resource_card(
+                            f"{row.device_id} · {row.house_id}",
+                            f"SOC · {row.ev_soc:.1f}% · départ prévu {EV_DEPART_MOYEN_H} h",
+                            f'<span class="{badge_class}">{state}</span>',
+                        )
     with hvac_tab:
-        hvac_display = house_inventory[["house_id", "hvac_kw"]].rename(
-            columns={"house_id": "Maison", "hvac_kw": "Puissance HVAC (kW)"}
-        )
-        st.dataframe(hvac_display, use_container_width=True, hide_index=True)
+        for start in range(0, len(house_inventory), 4):
+            columns = st.columns(4)
+            for column, row in zip(columns, house_inventory.iloc[start : start + 4].itertuples()):
+                with column:
+                    with st.container(border=True):
+                        resource_card(row.house_id, f"Puissance HVAC observée · {row.hvac_kw:.2f} kW")
 
 with grid_tab:
     st.subheader("Demande horaire agrégée")
-    figure = go.Figure()
-    figure.add_trace(
-        go.Scatter(
-            x=hourly["heure"],
-            y=hourly["demande_kw"],
-            mode="lines+markers",
-            name="Demande quartier",
-            line={"color": "#23875a", "width": 3},
-        )
-    )
-    figure.add_hline(
-        y=GRID_LIMIT_KW,
-        line_dash="dash",
-        line_color="#d17a32",
-        annotation_text=f"Limite réseau {GRID_LIMIT_KW} kW",
-        annotation_position="top left",
-    )
-    figure.update_layout(
-        xaxis_title="Heure",
-        yaxis_title="Puissance (kW)",
-        xaxis={"dtick": 1, "range": [0, 23]},
-        height=430,
-        margin={"l": 20, "r": 20, "t": 40, "b": 20},
-        template="plotly_white",
-        legend={"orientation": "h", "y": 1.08},
-    )
-    st.plotly_chart(figure, use_container_width=True)
+    figure = build_grid_figure(hourly)
+    st.plotly_chart(figure, width="stretch")
     st.caption(f"Pic mesuré : {measured_peak:.2f} kW à {peak_hour:02d} h. Les puissances sont agrégées par somme des maisons, en kW.")
 
 with orchestrator_tab:
-    st.subheader("Actions enregistrées")
-    if actions.empty:
-        st.info("Aucune action enregistrée pour ce scénario et ce jour.")
-    else:
-        st.dataframe(
-            actions.rename(
-                columns={
-                    "heure": "Heure",
-                    "device_id": "Ressource",
-                    "device_type": "Type",
-                    "action_type": "Action",
-                    "power_kw": "Puissance (kW)",
-                    "justification": "Justification",
-                }
-            ),
-            use_container_width=True,
-            hide_index=True,
+    with st.container(border=True):
+        st.subheader("Sandbox · simulation what-if")
+        st.markdown(
+            '<div class="sandbox-note">Le plan est recalculé en direct avec la limite choisie. Cette simulation what-if ne modifie aucune mesure ni aucun résultat enregistré.</div>',
+            unsafe_allow_html=True,
         )
-
-    st.divider()
-    st.subheader("Sandbox · simulation what-if")
-    st.caption("Le recalcul appelle directement orchestrator.dispatch() et ne modifie ni les mesures ni les résultats enregistrés en base.")
-    sandbox_limit = st.slider("Nouvelle limite réseau (kW)", min_value=100, max_value=200, value=GRID_LIMIT_KW, step=5)
+        sandbox_limit = st.slider("Nouvelle limite réseau (kW)", min_value=100, max_value=200, value=GRID_LIMIT_KW, step=5)
     sandbox_plan = run_sandbox(measurements, float(sandbox_limit))
     if sandbox_plan.empty:
         st.success(f"Aucun dispatch requis : la demande reste sous {sandbox_limit} kW toute la journée.")
@@ -326,21 +454,45 @@ with orchestrator_tab:
         summary_columns[0].metric("Limite simulée", f"{sandbox_limit} kW")
         summary_columns[1].metric("Puissance dispatchée", f"{action_total:.2f} kW")
         summary_columns[2].metric("Déficit résiduel max", f"{residual_peak:.2f} kW")
-        st.dataframe(sandbox_plan, use_container_width=True, hide_index=True)
+        st.dataframe(sandbox_plan, width="stretch", hide_index=True)
+
+    st.subheader("Journal des actions enregistrées")
+    if actions.empty:
+        st.caption("Aucune action enregistrée pour cette sélection.")
+    else:
+        for action in actions.itertuples():
+            resource_class = {
+                "battery": "timeline-battery",
+                "ev": "timeline-ev",
+                "hvac": "timeline-hvac",
+            }.get(action.device_type, "timeline-battery")
+            justification = escape(str(action.justification))
+            detail = escape(f"{action.device_id} · {action.action_type} · {abs(action.power_kw):.2f} kW")
+            with st.container(border=True):
+                st.markdown(
+                    f'<div class="timeline-entry {resource_class}"><div class="timeline-hour">{int(action.heure):02d}:00</div><div class="timeline-detail">{detail}</div><p class="timeline-justification">{justification}</p></div>',
+                    unsafe_allow_html=True,
+                )
 
 with results_tab:
     st.subheader("Résultats du jour sélectionné")
     if kpi.empty:
-        st.warning("Aucun KPI disponible en base pour cette sélection.")
+        st.caption("Aucun KPI disponible en base pour cette sélection.")
     else:
         kpi_row = kpi.iloc[0]
         before = float(kpi_row["pic_avant_kw"])
         after = float(kpi_row["pic_apres_kw"])
         reduction = ((before - after) / before * 100.0) if before else 0.0
         cards = st.columns(3)
-        cards[0].metric("Pic avant enregistré", f"{before:.2f} kW")
-        cards[1].metric("Pic après enregistré", f"{after:.2f} kW")
-        cards[2].metric("Réduction enregistrée", f"{reduction:.1f}%")
+        with cards[0]:
+            with st.container(border=True):
+                st.metric("Pic avant enregistré", f"{before:.2f} kW")
+        with cards[1]:
+            with st.container(border=True):
+                st.metric("Pic après enregistré", f"{after:.2f} kW", delta=f"{after - before:+.2f} kW", delta_color="inverse")
+        with cards[2]:
+            with st.container(border=True):
+                st.metric("Réduction enregistrée", f"{reduction:.1f}%", delta=f"{reduction:+.1f}%")
 
         scenario_peaks = read_query(
             """
@@ -354,24 +506,36 @@ with results_tab:
             ORDER BY scenario
             """
         )
+        scenario_order = {"normal": 0, "nuageux": 1, "canicule": 2}
+        scenario_peaks["order"] = scenario_peaks["scenario"].map(scenario_order)
+        scenario_peaks = scenario_peaks.sort_values("order")
+        scenario_colors = {
+            "normal": PLOTLY_COLORS["green_500"],
+            "nuageux": PLOTLY_COLORS["green_300"],
+            "canicule": PLOTLY_COLORS["green_700"],
+        }
         bar = go.Figure(
             go.Bar(
                 x=scenario_peaks["scenario"],
                 y=scenario_peaks["peak_kw"],
-                marker_color=["#3cb371", "#79bb91", "#d17a32"],
+                marker_color=[scenario_colors[scenario] for scenario in scenario_peaks["scenario"]],
                 text=scenario_peaks["peak_kw"].map(lambda value: f"{value:.1f} kW"),
                 textposition="outside",
             )
         )
-        bar.add_hline(y=GRID_LIMIT_KW, line_dash="dash", line_color="#6b756f", annotation_text="Limite 150 kW")
+        bar.add_hline(y=GRID_LIMIT_KW, line_dash="dash", line_color=PLOTLY_COLORS["text"], annotation_text="Limite 150 kW")
         bar.update_layout(
             title="Pic agrégé maximal par scénario",
             yaxis_title="Puissance (kW)",
             height=380,
-            template="plotly_white",
             margin={"l": 20, "r": 20, "t": 60, "b": 20},
+            paper_bgcolor="rgba(0, 0, 0, 0)",
+            plot_bgcolor="rgba(0, 0, 0, 0)",
+            font={"family": "Inter, sans-serif", "color": PLOTLY_COLORS["text"]},
+            xaxis={"gridcolor": "rgba(11, 61, 46, 0.08)"},
+            yaxis={"gridcolor": "rgba(11, 61, 46, 0.08)"},
         )
-        st.plotly_chart(bar, use_container_width=True)
+        st.plotly_chart(bar, width="stretch")
 
         kpi_table = read_query(
             """
@@ -385,4 +549,4 @@ with results_tab:
             (selected_scenario, selected_day),
         )
         st.markdown("**KPI enregistrés en base**")
-        st.dataframe(kpi_table, use_container_width=True, hide_index=True)
+        st.dataframe(kpi_table, width="stretch", hide_index=True)

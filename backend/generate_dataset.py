@@ -57,6 +57,11 @@ def generate_dataset():
     after = get_measurement_count()
     print(f"[Purge] lignes après purge : {after}")
 
+    daily_load_factors = {
+        (jour, maison_idx): float(np.clip(np.random.normal(1.0, 0.03), 0.9, 1.1))
+        for jour in range(NB_JOURS)
+        for maison_idx in range(NB_MAISONS)
+    }
     rows = []
     for scenario in SCENARIOS:
         for jour in range(NB_JOURS):
@@ -83,7 +88,7 @@ def generate_dataset():
                     ev_connected = 1 if (0 <= arrival <= 23 and 0 <= departure <= 23) else 0
 
                 for heure in range(24):
-                    base_load = house_profile(maison_idx, heure)
+                    base_load = house_profile(maison_idx, heure) * daily_load_factors[(jour, maison_idx)]
                     pv_output = pv_kw if has_pv and 7 <= heure <= 18 else 0.0
                     hvac_kw = 0.65 + 0.40 * (1 if 18 <= heure <= 22 else 0) + 0.15 * (maison_idx % 3)
                     if has_battery:
@@ -138,10 +143,15 @@ def generate_dataset():
             grid_import_kw=row["grid_import_kw"],
         )
 
-    summary = calibrated.groupby("scenario")["grid_import_kw"].max().sort_index()
-    print("Résumé génération dataset:")
-    for scenario, peak in summary.items():
-        print(f"  {scenario:8s}: pic max = {peak:.2f} kW")
+    hourly_peaks = (
+        calibrated.groupby(["scenario", "jour", "heure"])["grid_import_kw"]
+        .sum()
+        .groupby(["scenario", "jour"])
+        .max()
+    )
+    print("Pics quartier par scénario et par jour (kW):")
+    for (scenario, jour), peak in hourly_peaks.items():
+        print(f"  {scenario:8s} jour {jour}: {peak:.4f} kW")
 
     return calibrated
 
