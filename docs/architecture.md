@@ -3,25 +3,25 @@
 ## Flux applicatif
 
 ```text
-generate_dataset.py ──> SQLite: measurements
-                              │
-simulation.py ────────────────┼──> SQLite: orchestrator_actions + kpi_results
-                              │
-                              v
-                         app.py (Streamlit)
-                         ├── database.py: lecture directe des tables
-                         ├── models.py: ressources DER
-                         ├── forecasting.py: prévision utilisée par le moteur
-                         └── orchestrator.py: dispatch du Sandbox what-if
+run_pipeline.py
+  1. generate_dataset.py ──> SQLite : measurements, ev_sessions
+  2. forecasting_ml.py ────> models/*.joblib ; SQLite : forecasts, model_metrics, feature_importances
+  3. simulation.py ────────> SQLite : bilan_horaire, etat_batteries, orchestrator_actions, kpi_results
+        ├── models.py        Battery / EV / HVAC (état continu sur la période)
+        ├── orchestrator.py  dispatch batteries → VE → HVAC
+        └── kpi.py           agrégation quartier et KPI
+
+app.py (Streamlit)
+  ├── lecture directe de SQLite
+  └── sandbox : simulation.simuler_scenario() en mémoire, rien n'est écrit
+
+optimizer_lp.py : validation d'optimalité hors boucle principale (rejoue le mode réactif)
 ```
 
-## Simplification par rapport au prototype
+## Principes
 
-L'interface Streamlit remplace le dashboard HTML/JavaScript et lit la base SQLite directement via les modules Python. La couche d'export JSON et les fichiers de données de démonstration ne font plus partie de l'architecture cible. Il n'y a pas de serveur API séparé. Le Sandbox appelle `orchestrator.dispatch()` en mémoire et n'écrit pas ses résultats dans la base.
-
-## Responsabilités
-
-- `backend/generate_dataset.py` crée les mesures synthétiques.
-- `backend/simulation.py` exécute le scénario et persiste les actions et KPI.
-- `app.py` filtre et présente les données existantes, sans recopier les algorithmes métier.
-- `ider.db` est la source de vérité locale pour les mesures, actions et KPI.
+- STEG est la source de base (capacité `STEG_CAPACITY_KW`). Les DER couvrent le déficit au-delà de cette capacité.
+- Toutes les grandeurs du quartier sont des sommes sur les 20 maisons ; le bilan horaire est fermé à 1e-6 près.
+- Chaque scénario est simulé comme une chronologie continue : l'état des batteries se propage d'un jour au suivant.
+- La simulation est une fonction pure. La persistance est séparée, ce qui permet au tableau de bord et à la validation LP de réutiliser le même moteur.
+- Il n'y a ni API REST ni serveur de base de données séparé : `ider.db` est la source de vérité locale, régénérée par le pipeline.

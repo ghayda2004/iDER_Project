@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+
+# Artefacts régénérés par `python run_pipeline.py` (graine fixe, ~30 s)
+ider.db
+models/
+
+# Vidéo de démonstration générée par demo/generer_video_demo.py
+demo/*.mp4

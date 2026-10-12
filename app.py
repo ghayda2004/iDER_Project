@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from contextlib import closing
 from html import escape
 
 import pandas as pd
@@ -8,23 +7,26 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from backend.config import (
-    BATTERY_CAPACITY_KWH,
-    BATTERY_MAX_POWER_KW,
-    EV_BATTERY_CAPACITY_KWH,
-    EV_DEPART_MOYEN_H,
-    EV_MAX_CHARGE_KW,
-    GRID_LIMIT_KW,
-    MAISONS_AVEC_BATTERIE,
-    MAISONS_AVEC_EV,
-    MAISONS_AVEC_PV,
-    NB_MAISONS,
+    FACTEUR_CO2_KG_KWH,
+    MAPE_SEUIL_KW,
+    MODES,
+    N_DAYS,
     SCENARIOS,
+    SCENARIOS_METEO,
+    SOC_CIBLE,
+    SPLIT_TRAIN,
+    SPLIT_VAL,
+    STEG_CAPACITY_KW,
+    TARIF_CREUX_TND_KWH,
+    TARIF_PLEIN_TND_KWH,
+    TARIF_POINTE_TND_KWH,
+    WEATHER_FORECAST_NOISE_IRR_WM2,
+    WEATHER_FORECAST_NOISE_TEMP_C,
 )
-from backend.database import get_connection, init_db, load_measurements
-from backend.models import Battery, EV, HVAC
-from backend.orchestrator import dispatch
+from backend.database import lire, load_ev_sessions, load_measurements, schema_a_jour
+from backend.kpi import calculer_kpi, synthese_kpi
 
-st.set_page_config(page_title="iDER | Pilotage énergétique", page_icon="⚡", layout="wide")
+st.set_page_config(page_title="iDER | STEG et DER", page_icon="⚡", layout="wide")
 st.markdown(
     """
     <style>
@@ -47,13 +49,14 @@ st.markdown(
         background: var(--green-100);
         border-color: var(--green-300);
     }
-    section[data-testid="stSidebar"] [data-baseweb="select"] span,
-    section[data-testid="stSidebar"] [data-baseweb="select"] input { color: var(--green-900); }
+    section[data-testid="stSidebar"] [data-baseweb="select"] * { color: var(--green-900); }
+    [data-testid="stIconMaterial"], .material-symbols-rounded { font-family: 'Material Symbols Rounded' !important; }
     .ider-brand { color: var(--green-100); font-size: 1.55rem; font-weight: 700; }
     .ider-brand-note { color: var(--green-300); font-size: 0.82rem; }
     .ider-legend { margin-top: 1.25rem; padding-top: 0.9rem; border-top: 1px solid color-mix(in srgb, var(--green-100) 25%, transparent); }
     .legend-line { margin: 0.3rem 0; font-size: 0.82rem; }
-    .legend-dot { display: inline-block; width: 0.58rem; height: 0.58rem; border-radius: 50%; margin-right: 0.45rem; }
+    .legend-dot { display: inline-block; width: 0.58rem; height: 0.58rem; border-radius: 50%; margin-right: 0.45rem;
+                  border: 1px solid var(--green-100); }
     .stTabs [data-baseweb="tab-list"] { gap: 0.35rem; }
     .stTabs [aria-selected="true"] { color: var(--green-700); }
     [data-testid="stMetricLabel"] { color: var(--green-900); font-weight: 600; }
@@ -63,490 +66,363 @@ st.markdown(
     .soc-track { height: 0.58rem; width: 100%; background: var(--green-100); border-radius: 1rem; overflow: hidden; margin: 0.7rem 0 0.35rem; }
     .soc-fill { height: 100%; border-radius: inherit; }
     .status-badge { display: inline-block; padding: 0.18rem 0.5rem; border-radius: 1rem; background: var(--green-100); color: var(--green-700); font-size: 0.76rem; font-weight: 600; }
-    .status-muted { display: inline-block; padding: 0.18rem 0.5rem; border-radius: 1rem; background: color-mix(in srgb, var(--text) 8%, var(--bg)); color: var(--text); font-size: 0.76rem; font-weight: 600; }
-    .timeline-entry { border-left: 4px solid var(--green-700); padding: 0.12rem 0 0.12rem 0.85rem; }
-    .timeline-ev { border-left-color: var(--green-500); }
-    .timeline-hvac { border-left-color: var(--green-300); }
-    .timeline-hour { color: var(--green-900); font-weight: 700; }
-    .timeline-detail { color: color-mix(in srgb, var(--text) 78%, transparent); margin-top: 0.2rem; }
-    .timeline-justification { color: color-mix(in srgb, var(--text) 68%, transparent); font-size: 0.88rem; margin: 0.35rem 0 0; }
-    .sandbox-note { border-left: 3px solid var(--green-500); padding-left: 0.75rem; color: var(--text); }
-    .peak-warning { color: var(--alert); font-weight: 600; }
+    .sandbox-note { border-left: 3px solid var(--green-500); padding-left: 0.75rem; color: var(--text); margin-bottom: 0.8rem; }
+    .alert-note { border-left: 3px solid var(--alert); padding-left: 0.75rem; color: var(--text); margin-bottom: 0.8rem; }
     </style>
     """,
     unsafe_allow_html=True,
 )
-init_db()
 
-
-@st.cache_data(ttl=10)
-def read_query(query: str, params: tuple = ()) -> pd.DataFrame:
-    with closing(get_connection()) as connection:
-        return pd.read_sql_query(query, connection, params=params)
-
-
-@st.cache_data(ttl=10)
-def read_day(scenario: str, day: int) -> pd.DataFrame:
-    return load_measurements(scenario, day)
-
-
-def latest_kpi(scenario: str, day: int) -> pd.DataFrame:
-    return read_query(
-        """
-        SELECT pic_avant_kw, pic_apres_kw, energie_deplacee_kwh,
-               economie_estimee_eur, co2_evite_kg
-        FROM kpi_results
-        WHERE scenario = ? AND jour = ?
-        ORDER BY rowid DESC
-        LIMIT 1
-        """,
-        (scenario, day),
-    )
-
-
-def hourly_demand(measurements: pd.DataFrame) -> pd.DataFrame:
-    return (
-        measurements.groupby("heure", as_index=False)["grid_import_kw"]
-        .sum()
-        .rename(columns={"grid_import_kw": "demande_kw"})
-        .sort_values("heure")
-    )
-
-
-def build_resource_inventory(measurements: pd.DataFrame, actions: pd.DataFrame):
-    houses = measurements.sort_values(["heure", "house_id"]).groupby("house_id", as_index=False).agg(
-        pv_kw=("pv_kw", "max"),
-        battery_soc=("battery_soc", "last"),
-        ev_soc=("ev_soc", "last"),
-        ev_connected=("ev_connected", "max"),
-        hvac_kw=("hvac_kw", "last"),
-    )
-    pv_houses = houses[houses["pv_kw"] > 0].copy()
-    battery_houses = houses[houses["battery_soc"] > 0].copy()
-    ev_houses = houses[houses["ev_soc"] > 0].copy()
-
-    stress_by_id = {}
-    if not actions.empty:
-        battery_actions = actions[actions["device_type"] == "battery"]
-        stress_by_id = battery_actions.groupby("device_id")["power_kw"].apply(lambda values: values.abs().sum()).to_dict()
-
-    battery_houses["device_id"] = [f"B{index:03d}" for index in range(1, len(battery_houses) + 1)]
-    battery_houses["stress_score_kwh"] = battery_houses["device_id"].map(stress_by_id).fillna(0.0)
-    ev_houses["device_id"] = [f"E{index:03d}" for index in range(1, len(ev_houses) + 1)]
-    return pv_houses, battery_houses, ev_houses, houses
-
-
-def run_sandbox(measurements: pd.DataFrame, limit_kw: float) -> pd.DataFrame:
-    first_hour = measurements[measurements["heure"] == measurements["heure"].min()].sort_values("house_id")
-    batteries = [
-        Battery(f"B{index:03d}", BATTERY_CAPACITY_KWH, float(row.battery_soc), BATTERY_MAX_POWER_KW)
-        for index, row in enumerate(first_hour.itertuples(), start=1)
-        if row.battery_soc > 0
-    ]
-    evs = [
-        EV(
-            f"E{index:03d}",
-            EV_BATTERY_CAPACITY_KWH,
-            EV_MAX_CHARGE_KW,
-            bool(row.ev_connected),
-            18,
-            EV_DEPART_MOYEN_H,
-            float(row.ev_soc),
-        )
-        for index, row in enumerate(first_hour.itertuples(), start=1)
-        if row.ev_soc > 0
-    ]
-
-    plan = []
-    for hour in range(24):
-        hour_rows = measurements[measurements["heure"] == hour].sort_values("house_id")
-        if hour_rows.empty:
-            continue
-        demand = float(hour_rows["grid_import_kw"].sum())
-        deficit = max(0.0, demand - limit_kw)
-        if deficit <= 0:
-            continue
-
-        hvacs = [
-            HVAC(str(row.house_id), float(row.hvac_kw), 0.5, float(row.hvac_kw))
-            for row in hour_rows.itertuples()
-        ]
-        actions, remaining = dispatch(deficit, batteries, evs, hvacs)
-        for action in actions:
-            plan.append(
-                {
-                    "heure": hour,
-                    "demande_avant_kw": round(demand, 2),
-                    "limite_kw": limit_kw,
-                    "device_id": action["device_id"],
-                    "type": action["device_type"],
-                    "action": action["action_type"],
-                    "puissance_kw": action["power_kw"],
-                    "justification": action["justification"],
-                    "deficit_residuel_kw": round(remaining, 2),
-                }
-            )
-        if not actions:
-            plan.append(
-                {
-                    "heure": hour,
-                    "demande_avant_kw": round(demand, 2),
-                    "limite_kw": limit_kw,
-                    "device_id": "Aucune ressource disponible",
-                    "type": "-",
-                    "action": "NON_COUVERT",
-                    "puissance_kw": 0.0,
-                    "justification": f"Déficit non couvert : {remaining:.2f} kW",
-                    "deficit_residuel_kw": round(remaining, 2),
-                }
-            )
-    return pd.DataFrame(plan)
-
-
-PLOTLY_COLORS = {
+COULEURS = {
     "green_900": "#0B3D2E",
     "green_700": "#1F6F50",
     "green_500": "#3CB371",
     "green_300": "#8FD9B6",
-    "green_100": "#E3F5EC",
-    "bg": "#F7FAF8",
     "text": "#1C2620",
     "alert": "#E76F51",
 }
+# Une couleur par source du bilan énergétique
+COULEURS_SOURCES = {
+    "steg_import_kw": ("STEG", "#0B3D2E"),
+    "pv_utilise_kw": ("PV utilisé", "#E9C46A"),
+    "decharge_batteries_kw": ("Décharge batteries", "#3CB371"),
+    "ve_reporte_kw": ("Recharge VE reportée", "#8FD9B6"),
+    "hvac_reduit_kw": ("HVAC réduit", "#2A9D8F"),
+    "energie_non_desservie_kw": ("Énergie non desservie", "#E76F51"),
+}
+COULEURS_MODES = {"sans_orchestration": "#8FD9B6", "reactif": "#3CB371", "predictif": "#0B3D2E"}
+LIBELLES_MODES = {"sans_orchestration": "Sans orchestration", "reactif": "Réactif", "predictif": "Prédictif"}
+LIBELLES_SCENARIOS = {"normal": "Normal", "nuageux": "Nuageux", "canicule": "Canicule", "coupure_steg": "Coupure STEG"}
+LIBELLES_MODELES = {"ml": "ML (forêt aléatoire)", "baseline": "Baseline (moyenne même heure)", "persistance": "Persistance (veille)"}
+LIBELLES_CIBLES = {"demande_nette": "Demande nette", "charge": "Charge totale", "pv": "Production PV"}
+JOUR_DEBUT_TEST = int(N_DAYS * SPLIT_TRAIN) + int(N_DAYS * SPLIT_VAL)
 
 
-def render_metric_grid(metrics: list[dict], columns_per_row: int = 4) -> None:
-    for start in range(0, len(metrics), columns_per_row):
-        columns = st.columns(columns_per_row)
-        for column, item in zip(columns, metrics[start : start + columns_per_row]):
-            with column:
-                with st.container(border=True):
-                    st.metric(
-                        item["label"],
-                        item["value"],
-                        delta=item.get("delta"),
-                        delta_color=item.get("delta_color", "normal"),
-                    )
-
-
-def build_grid_figure(hourly: pd.DataFrame) -> go.Figure:
-    figure = go.Figure()
-    upper_exceedance = hourly["demande_kw"].clip(lower=GRID_LIMIT_KW)
-    limit_line = [GRID_LIMIT_KW] * len(hourly)
-    figure.add_trace(
-        go.Scatter(
-            x=hourly["heure"],
-            y=upper_exceedance,
-            mode="lines",
-            line={"width": 0, "color": PLOTLY_COLORS["alert"]},
-            hoverinfo="skip",
-            showlegend=False,
-        )
-    )
-    figure.add_trace(
-        go.Scatter(
-            x=hourly["heure"],
-            y=limit_line,
-            mode="lines",
-            line={"width": 0, "color": PLOTLY_COLORS["alert"]},
-            fill="tonexty",
-            fillcolor="rgba(231, 111, 81, 0.18)",
-            hoverinfo="skip",
-            showlegend=False,
-        )
-    )
-    figure.add_trace(
-        go.Scatter(
-            x=hourly["heure"],
-            y=hourly["demande_kw"],
-            mode="lines+markers",
-            name="Demande du quartier",
-            line={"color": PLOTLY_COLORS["green_700"], "width": 3},
-            marker={"color": PLOTLY_COLORS["green_500"], "size": 6},
-        )
-    )
-    figure.add_hline(
-        y=GRID_LIMIT_KW,
-        line_dash="dash",
-        line_color=PLOTLY_COLORS["text"],
-        annotation_text="Limite réseau",
-        annotation_position="top left",
-    )
+def mise_en_page(figure, titre, axe_x, axe_y, hauteur=420):
     figure.update_layout(
-        xaxis_title="Heure",
-        yaxis_title="Puissance (kW)",
-        xaxis={"dtick": 1, "range": [0, 23], "gridcolor": "rgba(11, 61, 46, 0.08)"},
-        yaxis={"gridcolor": "rgba(11, 61, 46, 0.08)"},
-        height=430,
-        margin={"l": 20, "r": 20, "t": 45, "b": 20},
+        title=titre,
+        xaxis_title=axe_x,
+        yaxis_title=axe_y,
+        height=hauteur,
+        margin={"l": 20, "r": 20, "t": 70, "b": 20},
         paper_bgcolor="rgba(0, 0, 0, 0)",
         plot_bgcolor="rgba(0, 0, 0, 0)",
-        font={"family": "Inter, sans-serif", "color": PLOTLY_COLORS["text"]},
-        legend={"orientation": "h", "y": 1.08},
+        font={"family": "Inter, sans-serif", "color": COULEURS["text"]},
+        legend={"orientation": "h", "y": -0.18},
+        xaxis={"gridcolor": "rgba(11, 61, 46, 0.08)"},
+        yaxis={"gridcolor": "rgba(11, 61, 46, 0.08)"},
     )
     return figure
 
 
-def resource_card(title: str, detail: str, badge: str | None = None) -> None:
-    st.markdown(f'<div class="resource-title">{escape(title)}</div>', unsafe_allow_html=True)
-    if badge:
-        st.markdown(badge, unsafe_allow_html=True)
-    st.markdown(f'<div class="resource-meta">{escape(detail)}</div>', unsafe_allow_html=True)
+@st.cache_data(ttl=60)
+def requete(query: str, params: tuple = ()) -> pd.DataFrame:
+    return lire(query, params)
 
 
-st.title("iDER | Orchestration énergétique")
-st.caption("Données de simulation du quartier · lecture directe de SQLite")
+@st.cache_resource
+def modeles_ml():
+    from backend.forecasting_ml import chemin_modele, load_models
 
-available_scenarios = read_query("SELECT DISTINCT scenario FROM measurements ORDER BY scenario")
-if available_scenarios.empty:
-    st.error("Aucune mesure disponible. Lancez d'abord `python backend/generate_dataset.py` puis `python backend/simulation.py`.")
+    if not (chemin_modele("charge").exists() and chemin_modele("pv").exists()):
+        return None
+    return load_models()
+
+
+@st.cache_data(show_spinner="Recalcul de la simulation en mémoire…")
+def simulation_sandbox(scenario: str, mode: str, capacite: float) -> dict:
+    """Rejoue le scénario avec une autre capacité STEG ; rien n'est écrit en base."""
+    from backend.forecasting_ml import previsions_demande_nette
+    from backend.simulation import preparer_entrees, simuler_scenario
+
+    entrees = preparer_entrees(load_measurements(scenario))
+    sessions = load_ev_sessions()
+    previsions = None
+    if mode == "predictif":
+        modeles = modeles_ml()
+        if modeles is None:
+            return {}
+        previsions = previsions_demande_nette(entrees["quartier"], scenario, modeles)
+    modes = ["sans_orchestration"] if mode == "sans_orchestration" else ["sans_orchestration", mode]
+    resultats = {m: simuler_scenario(entrees, sessions, scenario, m, capacite, previsions if m == "predictif" else None) for m in modes}
+    bilan = pd.concat([r["bilan"] for r in resultats.values()], ignore_index=True)
+    return {
+        "bilan": bilan[bilan["mode"] == mode],
+        "kpi": calculer_kpi(bilan).query("mode == @mode"),
+        "actions": resultats[mode]["actions"],
+        "etat_batteries": resultats[mode]["etat_batteries"],
+    }
+
+
+def donnees_du_jour(scenario, mode, jour, capacite):
+    if capacite == STEG_CAPACITY_KW:
+        params = (scenario, mode, jour)
+        return {
+            "bilan": requete("SELECT * FROM bilan_horaire WHERE scenario = ? AND mode = ? AND jour = ? ORDER BY heure", params),
+            "kpi": requete("SELECT * FROM kpi_results WHERE scenario = ? AND mode = ? AND jour = ?", params),
+            "actions": requete("SELECT * FROM orchestrator_actions WHERE scenario = ? AND mode = ? AND jour = ? ORDER BY heure, id", params),
+            "etat_batteries": requete("SELECT * FROM etat_batteries WHERE scenario = ? AND mode = ? AND jour = ? ORDER BY heure, device_id", params),
+        }
+    resultat = simulation_sandbox(scenario, mode, float(capacite))
+    if not resultat:
+        return {}
+    return {cle: df[df["jour"] == jour] for cle, df in resultat.items()}
+
+
+def carte_metriques(metriques, colonnes=4):
+    for debut in range(0, len(metriques), colonnes):
+        cols = st.columns(colonnes)
+        for col, item in zip(cols, metriques[debut: debut + colonnes]):
+            with col, st.container(border=True):
+                st.metric(item["label"], item["value"], delta=item.get("delta"), delta_color=item.get("delta_color", "normal"),
+                          help=item.get("help"))
+
+
+def fmt(valeur, decimales=1):
+    return f"{valeur:,.{decimales}f}".replace(",", " ").replace(".", ",")
+
+
+# ---------------------------------------------------------------------------
+st.title("iDER | STEG et ressources distribuées")
+st.caption("STEG est la source de base du quartier ; les DER couvrent le déficit. Lecture directe de SQLite.")
+
+if not schema_a_jour() or requete("SELECT COUNT(*) AS n FROM bilan_horaire")["n"].iloc[0] == 0:
+    st.error("Base absente, ancienne ou incomplète. Lancez `python run_pipeline.py` depuis la racine du projet.")
     st.stop()
 
-scenario_options = [scenario for scenario in SCENARIOS if scenario in available_scenarios["scenario"].tolist()]
+dates = requete("SELECT DISTINCT jour, date FROM measurements ORDER BY jour")
+scenarios_dispo = requete("SELECT DISTINCT scenario FROM bilan_horaire")["scenario"].tolist()
 with st.sidebar:
     st.markdown('<div class="ider-brand">iDER</div>', unsafe_allow_html=True)
-    st.markdown('<div class="ider-brand-note">Orchestration énergétique distribuée</div>', unsafe_allow_html=True)
+    st.markdown('<div class="ider-brand-note">STEG + orchestration des DER</div>', unsafe_allow_html=True)
     st.divider()
-    selected_scenario = st.selectbox("Scénario", scenario_options, format_func=lambda value: value.capitalize())
-available_days = read_query(
-    "SELECT DISTINCT jour FROM measurements WHERE scenario = ? ORDER BY jour",
-    (selected_scenario,),
-)
-day_options = available_days["jour"].astype(int).tolist()
-with st.sidebar:
-    selected_day = st.selectbox("Jour", day_options, format_func=lambda value: f"Jour {value}")
+    scenario = st.selectbox("Scénario", [s for s in SCENARIOS if s in scenarios_dispo], format_func=LIBELLES_SCENARIOS.get,
+                            key="scenario")
+    date_par_jour = dict(zip(dates["jour"], dates["date"]))
+    jour = st.selectbox(
+        "Jour", dates["jour"].tolist(), index=len(dates) - 1, key="jour",
+        format_func=lambda j: f"{date_par_jour[j]} · jour {j}" + (" · test ML" if j >= JOUR_DEBUT_TEST else ""),
+    )
+    mode = st.radio("Mode", MODES, index=1, format_func=LIBELLES_MODES.get, key="mode")
+    capacite = st.slider("Capacité STEG (kW) · sandbox", min_value=100, max_value=220, value=int(STEG_CAPACITY_KW), step=5, key="capacite",
+                         help="Toute autre valeur que 150 kW recalcule la simulation en mémoire, sans rien enregistrer.")
     st.markdown(
         """
         <div class="ider-legend">
-          <div class="legend-line"><span class="legend-dot" style="background:var(--green-500)"></span>Vert : ressources DER</div>
-          <div class="legend-line"><span class="legend-dot" style="background:var(--alert)"></span>Corail : dépassement réseau</div>
+          <div class="legend-line"><span class="legend-dot" style="background:#0B3D2E"></span>STEG</div>
+          <div class="legend-line"><span class="legend-dot" style="background:#E9C46A"></span>PV</div>
+          <div class="legend-line"><span class="legend-dot" style="background:var(--green-500)"></span>Ressources DER</div>
+          <div class="legend-line"><span class="legend-dot" style="background:var(--alert)"></span>Dépassement / non desservi</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-measurements = read_day(selected_scenario, selected_day)
-if measurements.empty:
-    st.error("Aucune mesure pour cette sélection.")
+donnees = donnees_du_jour(scenario, mode, jour, capacite)
+if capacite != STEG_CAPACITY_KW:
+    st.markdown(f'<div class="sandbox-note">Sandbox : capacité STEG de {capacite} kW. Résultats recalculés en mémoire sur toute la '
+                f'période (état continu des batteries), non enregistrés.</div>', unsafe_allow_html=True)
+if not donnees or donnees["bilan"].empty:
+    st.warning("Aucune donnée pour cette sélection (les modèles ML sont peut-être absents pour le mode prédictif).")
     st.stop()
 
-actions = read_query(
-    """
-    SELECT heure, device_id, device_type, action_type, power_kw, justification
-    FROM orchestrator_actions
-    WHERE scenario = ? AND jour = ?
-    ORDER BY heure, rowid
-    """,
-    (selected_scenario, selected_day),
+bilan = donnees["bilan"]
+st.subheader(f"{LIBELLES_SCENARIOS[scenario]} · {date_par_jour[jour]} · {LIBELLES_MODES[mode]}")
+if not donnees["kpi"].empty:
+    k = donnees["kpi"].iloc[0]
+    ecart_capacite = k["pic_steg_apres_kw"] - capacite
+    carte_metriques([
+        {"label": "Pic STEG avant", "value": f"{fmt(k['pic_steg_avant_kw'])} kW", "help": "Sans orchestration : max horaire de l'import STEG."},
+        {"label": "Pic STEG après", "value": f"{fmt(k['pic_steg_apres_kw'])} kW",
+         "delta": f"{fmt(ecart_capacite)} kW vs capacité" if abs(ecart_capacite) >= 0.05 else "au niveau de la capacité",
+         "delta_color": "inverse" if abs(ecart_capacite) >= 0.05 else "off"},
+        {"label": "Réduction du pic", "value": f"{fmt(k['reduction_pic_pct'])} %"},
+        {"label": "Énergie déplacée", "value": f"{fmt(k['energie_deplacee_kwh'])} kWh", "help": "Décharge batteries + recharge VE reportée + HVAC réduit."},
+        {"label": "Taux d'autonomie", "value": f"{fmt(k['taux_autonomie_pct'])} %", "help": "1 − énergie STEG / consommation servie."},
+        {"label": "Économie", "value": f"{fmt(k['economie_tnd'], 2)} TND", "help": "Facture sans orchestration − facture du mode (tarifs illustratifs)."},
+        {"label": "CO2 évité", "value": f"{fmt(k['co2_evite_kg'], 2)} kg", "help": "Peut être négatif : pertes de rendement des batteries."},
+        {"label": "Énergie non desservie", "value": f"{fmt(k['energie_non_desservie_kwh'], 2)} kWh"},
+    ])
+st.caption(
+    f"Tarifs ILLUSTRATIFS (à remplacer par la grille officielle STEG) : creux {TARIF_CREUX_TND_KWH}, plein {TARIF_PLEIN_TND_KWH}, "
+    f"pointe {TARIF_POINTE_TND_KWH} TND/kWh. Facteur CO2 illustratif : {FACTEUR_CO2_KG_KWH} kg/kWh."
 )
-kpi = latest_kpi(selected_scenario, selected_day)
-hourly = hourly_demand(measurements)
-peak_row = hourly.loc[hourly["demande_kw"].idxmax()]
-measured_peak = float(peak_row["demande_kw"])
-peak_hour = int(peak_row["heure"])
-pv_houses, battery_houses, ev_houses, house_inventory = build_resource_inventory(measurements, actions)
-pv_capacity_estimate = float(pv_houses["pv_kw"].sum()) if not pv_houses.empty else 0.0
 
-overview_tab, resources_tab, grid_tab, orchestrator_tab, results_tab = st.tabs(
-    ["Vue d'ensemble", "Parc de ressources", "Suivi réseau", "Orchestrateur", "Résultats"]
+onglet_bilan, onglet_ml, onglet_comparaison, onglet_actions, onglet_parc = st.tabs(
+    ["Bilan énergétique", "Prévision ML", "Réactif vs Prédictif", "Actions de l'orchestrateur", "Parc de ressources"]
 )
 
-with overview_tab:
-    st.subheader(f"{selected_scenario.capitalize()} · jour {selected_day}")
-    overview_metrics = [
-        {"label": "DER modélisées", "value": f"{MAISONS_AVEC_PV + MAISONS_AVEC_BATTERIE + MAISONS_AVEC_EV + NB_MAISONS}"},
-        {"label": "Puissance PV max observée", "value": f"{pv_capacity_estimate:.1f} kW"},
-        {"label": "Capacité batterie totale", "value": f"{MAISONS_AVEC_BATTERIE * BATTERY_CAPACITY_KWH:.0f} kWh"},
-        {"label": "Véhicules électriques", "value": f"{len(ev_houses)}"},
-        {
-            "label": "Demande au pic du jour",
-            "value": f"{measured_peak:.1f} kW",
-            "delta": f"{measured_peak - GRID_LIMIT_KW:+.1f} kW vs limite",
-            "delta_color": "inverse",
-        },
-    ]
-    if not kpi.empty:
-        kpi_row = kpi.iloc[0]
-        before = float(kpi_row["pic_avant_kw"])
-        after = float(kpi_row["pic_apres_kw"])
-        reduction = ((before - after) / before * 100.0) if before else 0.0
-        overview_metrics.extend(
-            [
-                {"label": "Réduction de pic enregistrée", "value": f"{reduction:.1f}%"},
-                {"label": "Économie estimée enregistrée", "value": f"{float(kpi_row['economie_estimee_eur']):.2f} €"},
-            ]
-        )
-        if abs(before - measured_peak) > 1.0:
-            st.markdown(
-                f'<div class="sandbox-note">Écart entre les mesures agrégées ({measured_peak:.2f} kW) et le pic KPI enregistré ({before:.4f} kW).</div>',
-                unsafe_allow_html=True,
-            )
+with onglet_bilan:
+    figure = go.Figure()
+    for colonne, (libelle, couleur) in COULEURS_SOURCES.items():
+        if bilan[colonne].abs().sum() > 1e-9:
+            figure.add_trace(go.Bar(x=bilan["heure"], y=bilan[colonne], name=libelle, marker_color=couleur))
+    figure.add_trace(go.Scatter(x=bilan["heure"], y=bilan["charge_totale_kw"], name="Charge totale (dont recharge batteries)",
+                                mode="lines+markers", line={"color": COULEURS["text"], "width": 2}))
+    figure.add_trace(go.Scatter(x=bilan["heure"], y=bilan["steg_disponible_kw"], name="Capacité STEG disponible",
+                                mode="lines", line={"color": COULEURS["alert"], "width": 2, "dash": "dash", "shape": "hv"}))
+    figure.update_layout(barmode="stack", xaxis={"dtick": 1})
+    st.plotly_chart(mise_en_page(figure, "Couverture horaire de la charge du quartier", "Heure", "Puissance (kW)", 470), width="stretch")
+    if mode == "sans_orchestration" and bilan["depassement_steg_kw"].max() > 0:
+        st.markdown(f'<div class="alert-note">Sans orchestration, STEG dépasse sa capacité de '
+                    f'{fmt(bilan["depassement_steg_kw"].max())} kW au maximum ({fmt(bilan["depassement_steg_kw"].sum())} kWh sur la journée).</div>',
+                    unsafe_allow_html=True)
+    st.caption("Identité vérifiée à chaque heure : STEG + contribution DER + PV utilisé + énergie non desservie = charge totale.")
+
+    etat = donnees["etat_batteries"]
+    if not etat.empty:
+        soc = go.Figure()
+        for device_id, serie in etat.groupby("device_id"):
+            soc.add_trace(go.Scatter(x=serie["heure"], y=serie["soc"] * 100, name=device_id, mode="lines"))
+        soc.add_hline(y=SOC_CIBLE * 100, line_dash="dot", line_color=COULEURS["green_700"], annotation_text="SoC cible")
+        st.plotly_chart(mise_en_page(soc, "État de charge des batteries (fin d'heure)", "Heure", "SoC (%)", 340), width="stretch")
+    with st.expander("Tableau horaire du bilan"):
+        st.dataframe(bilan.drop(columns=["scenario", "mode", "date", "jour"]).round(3), width="stretch", hide_index=True)
+
+with onglet_ml:
+    st.markdown('<div class="alert-note">Données synthétiques : le modèle apprend en partie le générateur. Les performances ci-dessous '
+                'ne sont pas transférables à un réseau réel.</div>', unsafe_allow_html=True)
+    metriques = requete("SELECT * FROM model_metrics WHERE split = 'test'")
+    if metriques.empty:
+        st.info("Aucune métrique en base. Lancez `python run_pipeline.py`.")
     else:
-        overview_metrics.append({"label": "KPI enregistrés", "value": "Indisponibles"})
-    render_metric_grid(overview_metrics)
-    st.caption("La puissance PV est estimée depuis les maxima observés; le dataset ne stocke pas la puissance nominale constructeur.")
+        cible = st.selectbox("Grandeur prévue (T+1 h)", list(LIBELLES_CIBLES), format_func=LIBELLES_CIBLES.get)
+        scenario_ml = scenario if scenario in SCENARIOS_METEO else "normal"
+        jours_test = requete("SELECT DISTINCT jour, date FROM forecasts WHERE split = 'test' ORDER BY jour")
+        jour_ml = st.selectbox("Jour de test", jours_test["jour"].tolist(),
+                               format_func=lambda j: dict(zip(jours_test["jour"], jours_test["date"]))[j])
+        prev = requete("SELECT * FROM forecasts WHERE scenario = ? AND jour = ? AND cible = ? ORDER BY heure",
+                       (scenario_ml, jour_ml, cible))
+        courbe = go.Figure()
+        reel = prev[prev["modele"] == "ml"]
+        courbe.add_trace(go.Scatter(x=reel["heure"], y=reel["y_true"], name="Réel", mode="lines+markers",
+                                    line={"color": COULEURS["text"], "width": 3}))
+        for modele, couleur in (("ml", COULEURS["green_500"]), ("baseline", "#E9C46A"), ("persistance", COULEURS["green_300"])):
+            part = prev[prev["modele"] == modele]
+            courbe.add_trace(go.Scatter(x=part["heure"], y=part["y_pred"], name=LIBELLES_MODELES[modele], mode="lines",
+                                        line={"color": couleur, "width": 2, "dash": "solid" if modele == "ml" else "dash"}))
+        if cible == "demande_nette":
+            courbe.add_hline(y=STEG_CAPACITY_KW, line_dash="dot", line_color=COULEURS["alert"], annotation_text="Capacité STEG")
+        st.plotly_chart(mise_en_page(courbe, f"{LIBELLES_CIBLES[cible]} : prévu vs réel ({LIBELLES_SCENARIOS[scenario_ml]})",
+                                     "Heure", "Puissance (kW)"), width="stretch")
 
-with resources_tab:
-    pv_tab, battery_tab, ev_tab, hvac_tab = st.tabs(["PV", "Batteries", "VE", "HVAC"])
-    with pv_tab:
-        st.caption(f"{len(pv_houses)} maisons avec production photovoltaïque observée")
-        for start in range(0, len(pv_houses), 4):
-            columns = st.columns(4)
-            for column, row in zip(columns, pv_houses.iloc[start : start + 4].itertuples()):
-                with column:
-                    with st.container(border=True):
-                        resource_card(row.house_id, f"Puissance PV max observée · {row.pv_kw:.2f} kW")
-    with battery_tab:
-        st.caption("SOC de fin de journée et cumul des décharges enregistrées par batterie.")
-        for start in range(0, len(battery_houses), 4):
-            columns = st.columns(4)
-            for column, row in zip(columns, battery_houses.iloc[start : start + 4].itertuples()):
-                soc_color = "var(--green-700)" if row.battery_soc >= 65 else "var(--green-300)"
-                with column:
-                    with st.container(border=True):
-                        resource_card(f"{row.device_id} · {row.house_id}", f"Stress d'équité · {row.stress_score_kwh:.2f} kWh")
-                        st.markdown(
-                            f'<div class="soc-track" role="progressbar" aria-valuenow="{row.battery_soc:.0f}" aria-valuemin="0" aria-valuemax="100"><div class="soc-fill" style="width:{min(100, max(0, row.battery_soc)):.1f}%;background:{soc_color}"></div></div><div class="resource-meta">SOC · {row.battery_soc:.1f}%</div>',
-                            unsafe_allow_html=True,
-                        )
-    with ev_tab:
-        for start in range(0, len(ev_houses), 4):
-            columns = st.columns(4)
-            for column, row in zip(columns, ev_houses.iloc[start : start + 4].itertuples()):
-                badge_class = "status-badge" if row.ev_connected else "status-muted"
-                state = "Connecté" if row.ev_connected else "Déconnecté"
-                with column:
-                    with st.container(border=True):
-                        resource_card(
-                            f"{row.device_id} · {row.house_id}",
-                            f"SOC · {row.ev_soc:.1f}% · départ prévu {EV_DEPART_MOYEN_H} h",
-                            f'<span class="{badge_class}">{state}</span>',
-                        )
-    with hvac_tab:
-        for start in range(0, len(house_inventory), 4):
-            columns = st.columns(4)
-            for column, row in zip(columns, house_inventory.iloc[start : start + 4].itertuples()):
-                with column:
-                    with st.container(border=True):
-                        resource_card(row.house_id, f"Puissance HVAC observée · {row.hvac_kw:.2f} kW")
+        tableau = metriques.copy()
+        tableau["modele"] = tableau["modele"].map(LIBELLES_MODELES)
+        tableau["cible"] = tableau["cible"].map(LIBELLES_CIBLES)
+        tableau = tableau.rename(columns={
+            "modele": "Modèle", "cible": "Cible", "mae_kw": "MAE (kW)", "rmse_kw": "RMSE (kW)", "mape_pct": "MAPE (%)",
+            "mae_pointe_kw": "MAE 17h-22h (kW)", "precision_deficit": "Précision déficit", "rappel_deficit": "Rappel déficit",
+            "faux_positifs": "Faux positifs", "faux_negatifs": "Faux négatifs", "n_echantillons": "Échantillons",
+        })
+        st.markdown("**Métriques sur la période de test (tous scénarios météo)**")
+        st.dataframe(tableau.drop(columns=["split", "horizon_h", "vrais_positifs"]).round(3), width="stretch", hide_index=True)
+        st.caption(f"MAPE calculé seulement quand la valeur réelle dépasse {MAPE_SEUIL_KW} kW (PV nul la nuit). Déficit = demande nette "
+                   f"> {STEG_CAPACITY_KW:.0f} kW. Météo prévue = réelle + bruit gaussien (σ {WEATHER_FORECAST_NOISE_TEMP_C} °C, "
+                   f"{WEATHER_FORECAST_NOISE_IRR_WM2} W/m²).")
 
-with grid_tab:
-    st.subheader("Demande horaire agrégée")
-    figure = build_grid_figure(hourly)
-    st.plotly_chart(figure, width="stretch")
-    st.caption(f"Pic mesuré : {measured_peak:.2f} kW à {peak_hour:02d} h. Les puissances sont agrégées par somme des maisons, en kW.")
+        col_hist, col_imp = st.columns(2)
+        erreurs = requete("SELECT modele, y_pred - y_true AS erreur FROM forecasts WHERE split = 'test' AND cible = ? AND modele IN ('ml', 'baseline')",
+                          (cible,))
+        hist = go.Figure()
+        for modele, couleur in (("baseline", "#E9C46A"), ("ml", COULEURS["green_500"])):
+            hist.add_trace(go.Histogram(x=erreurs.loc[erreurs["modele"] == modele, "erreur"], name=LIBELLES_MODELES[modele],
+                                        marker_color=couleur, opacity=0.75, nbinsx=50))
+        hist.update_layout(barmode="overlay")
+        col_hist.plotly_chart(mise_en_page(hist, "Distribution de l'erreur (test)", "Erreur prévu − réel (kW)", "Nombre d'heures", 380),
+                              width="stretch")
+        cible_imp = "pv" if cible == "pv" else "charge"
+        importances = requete("SELECT feature, importance FROM feature_importances WHERE cible = ? ORDER BY importance", (cible_imp,))
+        barres = go.Figure(go.Bar(x=importances["importance"], y=importances["feature"], orientation="h",
+                                  marker_color=COULEURS["green_700"], name="Importance"))
+        col_imp.plotly_chart(mise_en_page(barres, f"Importance des variables (modèle {LIBELLES_CIBLES[cible_imp].lower()})",
+                                          "Importance (réduction d'impureté)", "Variable", 380), width="stretch")
 
-with orchestrator_tab:
-    with st.container(border=True):
-        st.subheader("Sandbox · simulation what-if")
-        st.markdown(
-            '<div class="sandbox-note">Le plan est recalculé en direct avec la limite choisie. Cette simulation what-if ne modifie aucune mesure ni aucun résultat enregistré.</div>',
-            unsafe_allow_html=True,
-        )
-        sandbox_limit = st.slider("Nouvelle limite réseau (kW)", min_value=100, max_value=200, value=GRID_LIMIT_KW, step=5)
-    sandbox_plan = run_sandbox(measurements, float(sandbox_limit))
-    if sandbox_plan.empty:
-        st.success(f"Aucun dispatch requis : la demande reste sous {sandbox_limit} kW toute la journée.")
+with onglet_comparaison:
+    kpi_test = requete("SELECT * FROM kpi_results WHERE jour >= ?", (JOUR_DEBUT_TEST,))
+    if kpi_test.empty:
+        st.info("Aucun KPI sur la période de test.")
     else:
-        action_total = float(sandbox_plan["puissance_kw"].sum())
-        residual_peak = float(sandbox_plan["deficit_residuel_kw"].max())
-        summary_columns = st.columns(3)
-        summary_columns[0].metric("Limite simulée", f"{sandbox_limit} kW")
-        summary_columns[1].metric("Puissance dispatchée", f"{action_total:.2f} kW")
-        summary_columns[2].metric("Déficit résiduel max", f"{residual_peak:.2f} kW")
-        st.dataframe(sandbox_plan, width="stretch", hide_index=True)
+        st.markdown(f"Période de test ML : jours {JOUR_DEBUT_TEST} à {N_DAYS - 1}, capacité STEG {STEG_CAPACITY_KW:.0f} kW.")
+        synthese = synthese_kpi(kpi_test)
+        barres = go.Figure()
+        for m in MODES:
+            part = synthese[synthese["mode"] == m]
+            barres.add_trace(go.Bar(x=part["scenario"].map(LIBELLES_SCENARIOS), y=part["pic_steg_apres_kw"], name=LIBELLES_MODES[m],
+                                    marker_color=COULEURS_MODES[m]))
+        barres.add_hline(y=STEG_CAPACITY_KW, line_dash="dash", line_color=COULEURS["alert"], annotation_text="Capacité STEG")
+        barres.update_layout(barmode="group")
+        col_pic, col_eco = st.columns(2)
+        col_pic.plotly_chart(mise_en_page(barres, "Pic STEG maximal par scénario", "Scénario", "Puissance (kW)", 380), width="stretch")
+        eco = go.Figure()
+        for m in ("reactif", "predictif"):
+            part = synthese[synthese["mode"] == m]
+            eco.add_trace(go.Bar(x=part["scenario"].map(LIBELLES_SCENARIOS), y=part["economie_tnd"], name=LIBELLES_MODES[m],
+                                 marker_color=COULEURS_MODES[m]))
+        eco.update_layout(barmode="group")
+        col_eco.plotly_chart(mise_en_page(eco, "Économie cumulée sur la période de test", "Scénario", "Économie (TND)", 380), width="stretch")
+        affichage = synthese.assign(scenario=synthese["scenario"].map(LIBELLES_SCENARIOS), mode=synthese["mode"].map(LIBELLES_MODES)).rename(columns={
+            "scenario": "Scénario", "mode": "Mode", "jours": "Jours", "pic_steg_avant_kw": "Pic avant (kW)",
+            "pic_steg_apres_kw": "Pic après (kW)", "reduction_pic_moy_pct": "Réduction moy. (%)",
+            "energie_deplacee_kwh": "Énergie déplacée (kWh)", "energie_steg_kwh": "Énergie STEG (kWh)",
+            "consommation_kwh": "Consommation (kWh)", "facture_steg_tnd": "Facture (TND)", "economie_tnd": "Économie (TND)",
+            "co2_evite_kg": "CO2 évité (kg)", "energie_non_desservie_kwh": "Non desservi (kWh)",
+            "depassement_steg_kwh": "Dépassement STEG (kWh)", "taux_autonomie_pct": "Autonomie (%)",
+        })
+        st.dataframe(affichage.round(2), width="stretch", hide_index=True)
+        st.caption("Le prédictif reporte plus tôt la recharge des VE quand un pic est prévu, ce qui épargne les batteries ; "
+                   "son effet sur la facture reste faible et n'est pas garanti sur chaque scénario.")
 
-    st.subheader("Journal des actions enregistrées")
-    if actions.empty:
-        st.caption("Aucune action enregistrée pour cette sélection.")
+with onglet_actions:
+    actions = donnees["actions"]
+    if mode == "sans_orchestration":
+        st.info("Aucune action : la référence « sans orchestration » ne pilote aucune ressource.")
+    elif actions.empty:
+        st.info("Aucune action enregistrée pour cette journée.")
     else:
-        for action in actions.itertuples():
-            resource_class = {
-                "battery": "timeline-battery",
-                "ev": "timeline-ev",
-                "hvac": "timeline-hvac",
-            }.get(action.device_type, "timeline-battery")
-            justification = escape(str(action.justification))
-            detail = escape(f"{action.device_id} · {action.action_type} · {abs(action.power_kw):.2f} kW")
-            with st.container(border=True):
-                st.markdown(
-                    f'<div class="timeline-entry {resource_class}"><div class="timeline-hour">{int(action.heure):02d}:00</div><div class="timeline-detail">{detail}</div><p class="timeline-justification">{justification}</p></div>',
-                    unsafe_allow_html=True,
-                )
+        declencheurs = {"deficit": "Couverture du déficit", "anticipation": "Anticipation (prévision ML)", "recharge": "Recharge batteries"}
+        choix = st.multiselect("Déclencheur", list(declencheurs), default=list(declencheurs), format_func=declencheurs.get)
+        filtre = actions[actions["declencheur"].isin(choix)]
+        resume = filtre.groupby(["declencheur", "device_type"])["power_kw"].agg(["count", "sum"]).reset_index()
+        st.caption(" · ".join(f"{declencheurs[r.declencheur]} / {r.device_type} : {r['count']} actions, {fmt(r['sum'])} kWh"
+                              for _, r in resume.iterrows()))
+        st.dataframe(
+            filtre.assign(power_kw=filtre["power_kw"].round(2), declencheur=filtre["declencheur"].map(declencheurs))[
+                ["heure", "device_id", "device_type", "action_type", "declencheur", "power_kw", "justification"]
+            ].rename(columns={"heure": "Heure", "device_id": "Ressource", "device_type": "Type", "action_type": "Action",
+                              "declencheur": "Déclencheur", "power_kw": "Puissance (kW)", "justification": "Justification"}),
+            width="stretch", hide_index=True,
+        )
 
-with results_tab:
-    st.subheader("Résultats du jour sélectionné")
-    if kpi.empty:
-        st.caption("Aucun KPI disponible en base pour cette sélection.")
-    else:
-        kpi_row = kpi.iloc[0]
-        before = float(kpi_row["pic_avant_kw"])
-        after = float(kpi_row["pic_apres_kw"])
-        reduction = ((before - after) / before * 100.0) if before else 0.0
-        cards = st.columns(3)
-        with cards[0]:
-            with st.container(border=True):
-                st.metric("Pic avant enregistré", f"{before:.2f} kW")
-        with cards[1]:
-            with st.container(border=True):
-                st.metric("Pic après enregistré", f"{after:.2f} kW", delta=f"{after - before:+.2f} kW", delta_color="inverse")
-        with cards[2]:
-            with st.container(border=True):
-                st.metric("Réduction enregistrée", f"{reduction:.1f}%", delta=f"{reduction:+.1f}%")
-
-        scenario_peaks = read_query(
-            """
-            SELECT scenario, MAX(total_kw) AS peak_kw
-            FROM (
-                SELECT scenario, jour, heure, SUM(grid_import_kw) AS total_kw
-                FROM measurements
-                GROUP BY scenario, jour, heure
-            )
-            GROUP BY scenario
-            ORDER BY scenario
-            """
-        )
-        scenario_order = {"normal": 0, "nuageux": 1, "canicule": 2}
-        scenario_peaks["order"] = scenario_peaks["scenario"].map(scenario_order)
-        scenario_peaks = scenario_peaks.sort_values("order")
-        scenario_colors = {
-            "normal": PLOTLY_COLORS["green_500"],
-            "nuageux": PLOTLY_COLORS["green_300"],
-            "canicule": PLOTLY_COLORS["green_700"],
-        }
-        bar = go.Figure(
-            go.Bar(
-                x=scenario_peaks["scenario"],
-                y=scenario_peaks["peak_kw"],
-                marker_color=[scenario_colors[scenario] for scenario in scenario_peaks["scenario"]],
-                text=scenario_peaks["peak_kw"].map(lambda value: f"{value:.1f} kW"),
-                textposition="outside",
-            )
-        )
-        bar.add_hline(y=GRID_LIMIT_KW, line_dash="dash", line_color=PLOTLY_COLORS["text"], annotation_text="Limite 150 kW")
-        bar.update_layout(
-            title="Pic agrégé maximal par scénario",
-            yaxis_title="Puissance (kW)",
-            height=380,
-            margin={"l": 20, "r": 20, "t": 60, "b": 20},
-            paper_bgcolor="rgba(0, 0, 0, 0)",
-            plot_bgcolor="rgba(0, 0, 0, 0)",
-            font={"family": "Inter, sans-serif", "color": PLOTLY_COLORS["text"]},
-            xaxis={"gridcolor": "rgba(11, 61, 46, 0.08)"},
-            yaxis={"gridcolor": "rgba(11, 61, 46, 0.08)"},
-        )
-        st.plotly_chart(bar, width="stretch")
-
-        kpi_table = read_query(
-            """
-            SELECT scenario, jour, pic_avant_kw, pic_apres_kw,
-                   energie_deplacee_kwh, economie_estimee_eur, co2_evite_kg
-            FROM kpi_results
-            WHERE scenario = ? AND jour = ?
-            ORDER BY rowid DESC
-            LIMIT 1
-            """,
-            (selected_scenario, selected_day),
-        )
-        st.markdown("**KPI enregistrés en base**")
-        st.dataframe(kpi_table, width="stretch", hide_index=True)
+with onglet_parc:
+    mesures = requete("SELECT * FROM measurements WHERE scenario = ? AND jour = ?", (scenario, jour))
+    sessions = requete("SELECT * FROM ev_sessions WHERE jour = ?", (jour,))
+    etat_fin = donnees["etat_batteries"]
+    etat_fin = etat_fin[etat_fin["heure"] == etat_fin["heure"].max()] if not etat_fin.empty else etat_fin
+    onglet_bat, onglet_ve, onglet_pv, onglet_hvac = st.tabs(["Batteries", "VE", "PV", "HVAC"])
+    with onglet_bat:
+        st.caption("SoC à 23h et score d'équité cumulé depuis le début de la période (kWh déchargés).")
+        lignes = list(etat_fin.itertuples())
+        for debut in range(0, len(lignes), 4):
+            for col, row in zip(st.columns(4), lignes[debut: debut + 4]):
+                with col, st.container(border=True):
+                    st.markdown(f'<div class="resource-title">{escape(row.device_id)}</div>', unsafe_allow_html=True)
+                    st.markdown(
+                        f'<div class="soc-track"><div class="soc-fill" style="width:{row.soc * 100:.1f}%;background:var(--green-700)"></div></div>'
+                        f'<div class="resource-meta">SoC {row.soc * 100:.0f} % · stress {row.stress_score:.1f} kWh</div>',
+                        unsafe_allow_html=True,
+                    )
+    with onglet_ve:
+        if sessions.empty:
+            st.info("Aucune session VE ce jour.")
+        else:
+            st.dataframe(sessions.rename(columns={"house_id": "Maison", "arrivee_h": "Arrivée (h)", "depart_h": "Départ le lendemain (h)",
+                                                  "soc_arrivee": "SoC arrivée", "energie_kwh": "Énergie à livrer (kWh)"})
+                         .drop(columns=["jour", "date"]).round(2), width="stretch", hide_index=True)
+    with onglet_pv:
+        pv = mesures[mesures["pv_kw"] > 0].groupby("house_id")["pv_kw"].agg(["max", "sum"]).reset_index()
+        st.dataframe(pv.rename(columns={"house_id": "Maison", "max": "Puissance max (kW)", "sum": "Production du jour (kWh)"}).round(2),
+                     width="stretch", hide_index=True)
+    with onglet_hvac:
+        hvac = mesures.groupby("house_id")["hvac_kw"].agg(["mean", "max", "sum"]).reset_index()
+        st.dataframe(hvac.rename(columns={"house_id": "Maison", "mean": "Moyenne (kW)", "max": "Max (kW)", "sum": "Énergie (kWh)"}).round(2),
+                     width="stretch", hide_index=True)

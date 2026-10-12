@@ -1,6 +1,8 @@
 pandas
 numpy
-pulp
+pulp>=3.3,<4
 pytest
-streamlit
+streamlit>=1.50
 plotly
+scikit-learn
+joblib
